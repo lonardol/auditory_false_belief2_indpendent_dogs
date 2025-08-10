@@ -1,0 +1,449 @@
+---
+title: "Auditory_FB_dogs_power_analysis"
+author: "Christoph Völter, Lucrezia Lonardo"
+output: html_document
+date: "2025-08-10"
+---
+
+
+```{r}
+rm(list=ls())
+library(tidyverse)
+library(cowplot)
+library(gghalves)
+library(ggthemes)
+library(lme4)
+library(kyotil) # we want to store info about convergence issues
+```
+
+
+Notes: between subject design, prediction:
+cooperative dogs follow suggestion more often in FB than TB.
+independent dogs other way around.
+
+
+
+```{r}
+set.seed(1)
+n.subject <- seq(from=312, to=540, by=12) # number subjects (from 104 to 180 per condition)
+n.per.subject <- 1 # observations per subject
+n.per.condition <- 1 # observations per subject and condition
+subj.id <- as.factor(paste("subj", 1:n.subject, sep = "."))
+age.range <- c(10:168)
+breed <- c(
+  "akita_inu","andalusian_hound","appenzell_cattle_dog","australian_cattle_dog",
+  "australian_shepherd","austrian_pinscher","basenji","beagle","belgian_shepherd",
+  "bernese_mountain_dog","bobtail","bohemian_shepherd_dog","border_collie",
+  "bouvier_des_flandres","brittany_spaniel","bullmastiff","canarian_warrenhound",
+  "cocker_spaniel","collie","dalmatian","danish_swedish_farmdog","dutch_shepherd",
+  "english_springer_spaniel","entlebucher_mountain_dog","flat_coated_retriever",
+  "french_water_dog","german_longhaired_pointer","german_pinscher","german_shepherd",
+  "german_short_haired_pointer","german_spitz","german_wirehaired_pointer",
+  "golden_retriever","great_swiss_mountain_dog","greyhound","hovawart",
+  "hungarian_shorthaired_pointer","icelandic_sheepdog","irish_setter","italian_spinone",
+  "kleiner_muensterlaender","labrador_retriever","miniature_american_shepherd",
+  "miniature_pinscher","mudi","nova_scotia_duck_tolling_retriever","picardy_spaniel",
+  "portuguese_water_dog","romagna_water_dog","rottweiler","samoyed","schnauzer",
+  "shetland_sheepdog","siberian_husky","silken_windsprite","spanish_water_dog",
+  "weimaraner","welsh_corgi","whippet","white_swiss_shepherd",
+  "jack_russel_terrier","parson_russel_terrier","border_terrier",
+  "west_highland_white_terrier","yorkshire_terrier","fox_terrier","scottish_terrier","skye_terrier"
+)
+
+# Desired cell probabilities:
+# Independent
+ind.breed_fb.per     <- 0.4
+ind.breed_tb.per     <- 0.55
+ind.breed_knctr.per  <- 0.4
+# Cooperative
+coop.breed_fb.per    <- 0.50 
+coop.breed_tb.per    <- 0.39
+coop.breed_knctr.per <- 0.38
+
+
+start.data <- data.frame(subj.id)
+
+xdata <- data.frame(expand.grid(
+  condition   = c("false_belief", "true_belief", "knowledge_sound_control"),
+  sex         = c("F", "M"),
+  baited.fst  = c("blue", "grey"),
+  breed_type  = c("cooperative", "independent")
+))
+m.mat <- model.matrix(object = ~ condition*breed_type + sex + baited.fst, data = xdata)
+
+start.data <- cbind(start.data, xdata) # useful for creating counterbalancing
+
+table(start.data$condition, start.data$sex)
+table(start.data$baited.fst, start.data$sex)
+table(start.data$condition, start.data$baited.fst)
+table(start.data$condition, start.data$breed_type)
+
+# Checks
+xx <- table(start.data$subj.id, start.data$condition)
+range(apply(X = xx > 0, MARGIN = 1, sum))
+
+xx <- table(start.data$subj.id, start.data$sex)
+range(apply(X = xx > 0, MARGIN = 1, sum))
+
+xx <- table(start.data$subj.id, start.data$breed_type)
+range(apply(X = xx > 0, MARGIN = 1, sum))
+
+# random effects for breed
+r.effects <- 0.001
+# random slope for condition within breed
+r.slope.condition <- 0.45  # note: sd should be non-negative
+```
+
+
+# Simulation
+
+
+
+```{r}
+
+n.simus <- 4
+
+all.res.all.samples <- data.frame()
+
+# define control structure to make convergence more likely:
+contr <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000), nAGQ = FALSE)
+
+for (j in 1:length(n.subject)) {
+
+  # create object to store the simulation parameters and results:
+  all.res <- data.frame(expand.grid(
+    r.effect = r.effects,
+    n.per.subject = n.per.subject,
+    r.slope.condition = r.slope.condition,
+ #   fb.per = fb.per,          # cooperative FB baseline by condition
+#  tb.per = tb.per,
+#    knctr.per = knctr.per,
+    simu = 1:n.simus
+  ))
+  all.res$n.subject <- n.subject[j]
+  all.res$icpt <- NA
+  all.res$conditiontrue_belief <- NA
+  all.res$conditionknowledge_sound_control <- NA
+  all.res$`conditiontrue_belief:breed_typeindependent` <- NA
+  all.res$`conditionknowledge_sound_control:breed_typeindependent` <- NA
+  all.res$sexM <- NA
+  all.res$baited.fstgrey <- NA
+  all.res$breed_typeindependent <- NA
+  all.res$z.age <- NA
+  all.res$re.sd <- NA
+  all.res$warns.full <- NA
+  all.res$warns.null <- NA
+  
+  # Full-null LRT
+  all.res$lrt.p.fullnull <- NA
+
+  # drop1 LRT p-values for all terms in full model
+  all.res$lrt.p.drop1.condition_breed_type <- NA
+  all.res$lrt.p.drop1.sex <- NA
+  all.res$lrt.p.drop1.baited_fst <- NA
+  all.res$lrt.p.drop1.z_age <- NA
+  
+  all.ests <- matrix(NA, nrow = n.simus, ncol = 1)
+  colnames(all.ests) <- c("lrt.p.fullnull")
+
+    # Create subject IDs for this sample size
+  start.data <- data.frame(subj.id = as.factor(paste("subj", stringr::str_pad(1:n.subject[j], 2, pad = "0"), sep = ".")))
+
+  # Between-subjects design grid (24 cells)
+  design <- expand.grid(
+    condition   = c("false_belief", "true_belief", "knowledge_sound_control"),
+    sex         = c("F", "M"),
+    baited.fst  = c("blue", "grey"),
+    breed_type  = c("cooperative", "independent"),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
+
+  # Repeat the 24-row design to match the number of subjects
+  design_rep <- design[rep(seq_len(nrow(design)), length.out = nrow(start.data)), , drop = FALSE]
+
+  # Combine subject IDs with design
+  start.data <- cbind(start.data, design_rep)
+  
+  # add age and breed (if they should be generated in each loop)
+  age <- sample(x = age.range, size = length(unique(start.data$subj.id)), replace = TRUE)
+  start.data$age <- as.numeric(age[as.numeric(start.data$subj.id)])
+  start.data$z.age <- as.vector(scale(as.numeric(start.data$age)))
+  start.data$breed <- as.factor(sample(x = breed, size = length(unique(start.data$subj.id)), replace = TRUE))
+
+  # dummy code factors
+  start.data$condition <- as.factor(start.data$condition)
+  start.data$condition.dummy1 <- as.numeric(start.data$condition == levels(start.data$condition)[2])
+  start.data$condition.dummy2 <- as.numeric(start.data$condition == levels(start.data$condition)[3])
+
+  # center condition for random slopes:
+  start.data$condition.dummy1.c <- start.data$condition.dummy1 - mean(start.data$condition.dummy1)
+  start.data$condition.dummy2.c <- start.data$condition.dummy2 - mean(start.data$condition.dummy2)
+
+  xdata <- start.data
+
+  # run simulation
+  for (i in 1:nrow(all.res)) {
+    set.seed(i) # allows to later replicate individual simulations
+
+    # sample age
+    xdata$age <- as.numeric(age[as.numeric(xdata$subj.id)])
+    xdata$z.age <- as.vector(scale(as.numeric(xdata$age)))
+    # sample breed
+    xdata$breed <- as.factor(sample(x = breed, size = length(unique(xdata$subj.id)), replace = TRUE))
+
+    # Make sure model matrix uses the intended levels
+    xdata$condition <- factor(xdata$condition, levels = c("false_belief","true_belief","knowledge_sound_control"))
+    xdata$breed_type <- factor(xdata$breed_type, levels = c("cooperative","independent"))
+    xdata$sex <- factor(xdata$sex, levels = c("F","M"))
+    xdata$baited.fst <- factor(xdata$baited.fst, levels = c("blue","grey"))
+
+    m.mat <- model.matrix(object = ~ condition*breed_type + sex + baited.fst + z.age, data = xdata)
+
+    # Build coefficients to match the six target cell probabilities
+    logit <- function(p) log(p/(1-p))
+
+    # reference cell: cooperative, false_belief
+    lp_FB_coop <- logit(coop.breed_fb.per)
+    lp_TB_coop <- logit(coop.breed_tb.per)
+    lp_KN_coop <- logit(coop.breed_knctr.per)
+
+    lp_FB_ind  <- logit(ind.breed_fb.per)
+    lp_TB_ind  <- logit(ind.breed_tb.per)
+    lp_KN_ind  <- logit(ind.breed_knctr.per)
+
+    coefs <- c(
+      "(Intercept)" = lp_FB_coop,
+      # condition main effects (cooperative baseline)
+      "conditiontrue_belief" = lp_TB_coop - lp_FB_coop,
+      "conditionknowledge_sound_control" = lp_KN_coop - lp_FB_coop,
+      # breed_type main effect (false_belief baseline)
+      "breed_typeindependent" = lp_FB_ind - lp_FB_coop,
+      # interactions: ensure independent TB/KN match their target logits
+      "conditiontrue_belief:breed_typeindependent" =
+        lp_TB_ind - (lp_FB_coop + (lp_TB_coop - lp_FB_coop) + (lp_FB_ind - lp_FB_coop)),
+      "conditionknowledge_sound_control:breed_typeindependent" =
+        lp_KN_ind - (lp_FB_coop + (lp_KN_coop - lp_FB_coop) + (lp_FB_ind - lp_FB_coop)),
+      # covariates
+      "sexM" = 0,
+      "baited.fstgrey" = 0,
+      "z.age" = -0.49
+    )
+
+    # LP wrt fixed effects
+    LP <- m.mat[, names(coefs)] %*% coefs
+
+    # add random effect to linear predictor:
+    LP <- LP +
+      rnorm(n = n.subject[j], sd = all.res[i, "r.effect"])[as.numeric(xdata$breed)] +
+      rnorm(n = n.subject[j], sd = all.res[i, "r.slope.condition"])[as.numeric(xdata$breed)] * xdata$condition.dummy1.c +
+      rnorm(n = n.subject[j], sd = all.res[i, "r.slope.condition"])[as.numeric(xdata$breed)] * xdata$condition.dummy2.c
+
+    # generate response:
+    xdata$choice <- rbinom(n = nrow(xdata), size = 1, prob = exp(LP) / (1 + exp(LP)))
+
+    # fit full model:
+    full <- keepWarnings(glmer(
+      choice ~ condition*breed_type + sex + baited.fst + z.age +
+        (1 + condition.dummy1.c + condition.dummy2.c | breed),
+      family = binomial, data = xdata, control = contr
+    ))
+
+    # fit null model: (to get a test of condition as a whole)
+    null <- keepWarnings(glmer(
+      choice ~ sex + baited.fst + z.age +
+        (1 | breed),
+      family = binomial, data = xdata, control = contr
+    ))
+
+    d1 <- tryCatch(as.data.frame(drop1(full$value, test = "Chisq")),
+                   error = function(e) NULL)
+
+    
+    # calculate average performance by condition and breed_type
+    xdata_agg <- xdata %>%
+      group_by(condition, breed_type) %>%
+    summarise(mean_choice = mean(choice))
+    
+    # store results:
+    fe <- fixef(full$value)
+    all.res[i, c("icpt",
+                 "conditiontrue_belief",
+                 "conditionknowledge_sound_control",
+                 "breed_typeindependent",
+                 "conditiontrue_belief:breed_typeindependent",
+                 "conditionknowledge_sound_control:breed_typeindependent",
+                 "sexM", "baited.fstgrey", "z.age")] <-
+      fe[c("(Intercept)",
+           "conditiontrue_belief",
+           "conditionknowledge_sound_control",
+           "breed_typeindependent",
+           "conditiontrue_belief:breed_typeindependent",
+           "conditionknowledge_sound_control:breed_typeindependent",
+           "sexM","baited.fstgrey","z.age")]
+
+    all.res[i, "warns.full"] <- nchar(paste(full$warnings, collapse = ""))
+    all.res[i, "warns.null"] <- nchar(paste(null$warnings, collapse = ""))
+    all.res[i, "re.sd"] <- as.data.frame(summary(full$value)$varcor)[1, "sdcor"]
+
+    all.res[i, "lrt.p.fullnull"] <- as.data.frame(anova(null$value, full$value, test = "Chisq"))[2, "Pr(>Chisq)"]
+    all.res[i, "lrt.p.drop1.condition_breed_type"] <- d1["condition:breed_type", "Pr(Chi)"]
+    all.res[i, "lrt.p.drop1.sex"] <- d1["sex", "Pr(Chi)"]
+    all.res[i, "lrt.p.drop1.baited_fst"] <- d1["baited.fst", "Pr(Chi)"]
+    all.res[i, "lrt.p.drop1.z_age"] <- d1["z.age", "Pr(Chi)"]
+
+    all.res[i, c("mean_choice_fb_cooperative", "mean_choice_fb_independent",
+                 "mean_choice_tb_cooperative", "mean_choice_tb_independent",
+                 "mean_choice_knctr_cooperative", "mean_choice_knctr_independent")] <- xdata_agg$mean_choice
+
+    print(c("sim # =", i, " sample size =", n.subject[j]))
+  }
+
+  all.res.all.samples <- rbind(all.res.all.samples, all.res)
+}
+
+save.image("power_sim_Auditory_FB2_ver2.RData")
+```
+
+
+
+## Evaluation of results
+
+- Number of warnings per parameter cell (out of n.simus per cell)
+```{r}
+# full model warnings
+warn_table <- with(
+  all.res.all.samples,
+  tapply(
+    X = (warns.full > 0),
+    INDEX = list(
+      n.subject = n.subject,
+      r.effect = r.effect,
+      r.slope.condition = r.slope.condition
+    ),
+    FUN = sum
+  )
+)
+#warn_table
+
+```
+
+
+Only models that converged are evaluated from here on
+```{r}
+all.res2 <- subset(all.res.all.samples, warns.full == 0)
+
+```
+
+
+How many models converged and power based on LRT of condition
+```{r}
+library(dplyr)
+
+# how many converged per cell
+n.converged <- all.res2 %>%
+  group_by(n.subject, r.effect, r.slope.condition) %>%
+  summarise(n.converged = n(), .groups = "drop")
+
+# summarise LRT results; compute condition means averaged across breed types
+lrt.data2 <- all.res2 %>%
+  group_by(n.subject, r.effect, r.slope.condition) %>%
+  summarise(
+    lrt.p.fullnull.median = median(lrt.p.fullnull, na.rm = TRUE),
+    n.sign.lrt.fullnull = sum(lrt.p.fullnull < 0.025, na.rm = TRUE),
+    n.lrt = n(),
+    proportion.sign.lrt.fullnull = n.sign.lrt.fullnull/ n.simus,
+    lrt.p.int.median = median(lrt.p.drop1.condition_breed_type, na.rm = TRUE),
+    n.sign.lrt.int = sum(lrt.p.drop1.condition_breed_type < 0.025, na.rm = TRUE),
+    n.lrt = n(),
+    proportion.sign.lrt.int = n.sign.lrt.int/ n.simus,
+    mean_choice_fb_cooperative = mean(mean_choice_fb_cooperative, na.rm = TRUE),
+    mean_choice_fb_independent = mean(mean_choice_fb_independent, na.rm = TRUE),
+    mean_choice_tb_cooperative = mean(mean_choice_tb_cooperative, na.rm = TRUE),
+    mean_choice_tb_independent = mean(mean_choice_tb_independent, na.rm = TRUE),
+    mean_choice_knctr_cooperative = mean(mean_choice_knctr_cooperative, na.rm = TRUE),
+    mean_choice_knctr_independent = mean(mean_choice_knctr_independent, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  full_join(n.converged, by = c("n.subject","r.effect","r.slope.condition"))
+
+lrt.data2
+save.image("power_sim_Auditory_FB2.RData")
+
+
+```
+
+Plotting: power vs total sample size
+```{r}
+library(ggplot2)
+
+plot.sample.sizes.power.auditory_FB <- ggplot(lrt.data2,
+                                              aes(x = n.subject, y = proportion.sign.lrt.fullnull * 100)) +
+  geom_col() +
+  ylab("Power (% significant LRT for full–null comparison)") +
+  xlab("Total sample size") + scale_x_continuous(breaks = sort(unique(lrt.data2$n.subject))) + geom_hline(
+    yintercept = 80,
+    col = "blue",
+    lty = 2,
+    lwd = 0.9
+  ) + theme_classic()
+
+ggsave(plot.sample.sizes.power.auditory_FB, filename = "./plot/sample_sizes_power_analysis_auditory_FB.png", scale = 0.55, height = 6, width = 10)
+```
+
+
+Condition means (averaged across breed types), by sample size
+
+```{r}
+library(tidyr)
+
+
+cond_means_bt <- lrt.data2 %>% select(
+  n.subject,
+  mean_choice_fb_cooperative,
+  mean_choice_tb_cooperative,
+  mean_choice_knctr_cooperative,
+  mean_choice_fb_independent,
+  mean_choice_tb_independent,
+  mean_choice_knctr_independent
+) %>% pivot_longer(-n.subject, names_to = "name", values_to = "mean_choice") %>% mutate(
+  breed_type = ifelse(grepl("cooperative$", name), "cooperative", "independent"),
+  condition = case_when(
+    grepl("fb", name) ~ "fb",
+    grepl("tb", name) ~ "tb",
+    grepl("knctr", name) ~ "control",
+    TRUE ~ NA_character_
+  )
+)
+
+
+ggplot(cond_means_bt,
+       aes(x = condition, y = mean_choice, fill = breed_type)) +
+  geom_col(position = position_dodge(width = 0.8), color = "black") +
+  facet_wrap(~ n.subject) + theme_classic() + labs(y = "Mean choice", x = "Condition", fill = "Breed type")
+```
+
+
+
+Proportion of significant LRTs for condition (converged models only)
+
+```{r}
+# If  r.effect and/or r.slope.condition vary, facet by them; if not, this reduces to bars by N
+p.int.power <- ggplot(lrt.data2, aes(x = factor(n.subject), y = proportion.sign.lrt.int)) +
+  geom_col(color = "black", fill = "dodgerblue") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  geom_hline(yintercept = 0.8, colour = "black", lwd = 1, lty = 2) +
+  labs(y = "Power (proportion significant LRT for condition:breed type)",
+       x = "Total sample size (N)") +
+  theme_bw() +
+  facet_grid(r.slope.condition ~ r.effect, labeller = label_both)
+
+p.int.power
+
+ggsave(p.int.power,
+       filename = "differentNs_power3.png",
+       scale = 0.55, height = 12, width = 16)
+```
+
+
+
