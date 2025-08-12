@@ -1,0 +1,473 @@
+---
+title: "Power simulation for a binomial GLMM with a 2x3 interaction using parallelisation"
+output: html_document
+date: "2025-08-10"
+---
+
+
+```{r}
+rm(list=ls())
+library(tidyverse)
+library(cowplot)
+library(gghalves)
+library(ggthemes)
+library(lme4)
+library(kyotil)   # keepWarnings
+library(parallel) # base R parallel
+```
+
+
+```{r}
+set.seed(1)
+n.subject <- seq(from=312, to=540, by=12)
+n.per.subject <- 1
+n.per.condition <- 1
+age.range <- 10:168
+breed <- c(
+  "akita_inu","andalusian_hound","appenzell_cattle_dog","australian_cattle_dog",
+  "australian_shepherd","austrian_pinscher","basenji","beagle","belgian_shepherd",
+  "bernese_mountain_dog","bobtail","bohemian_shepherd_dog","border_collie",
+  "bouvier_des_flandres","brittany_spaniel","bullmastiff","canarian_warrenhound",
+  "cocker_spaniel","collie","dalmatian","danish_swedish_farmdog","dutch_shepherd",
+  "english_springer_spaniel","entlebucher_mountain_dog","flat_coated_retriever",
+  "french_water_dog","german_longhaired_pointer","german_pinscher","german_shepherd",
+  "german_short_haired_pointer","german_spitz","german_wirehaired_pointer",
+  "golden_retriever","great_swiss_mountain_dog","greyhound","hovawart",
+  "hungarian_shorthaired_pointer","icelandic_sheepdog","irish_setter","italian_spinone",
+  "kleiner_muensterlaender","labrador_retriever","miniature_american_shepherd",
+  "miniature_pinscher","mudi","nova_scotia_duck_tolling_retriever","picardy_spaniel",
+  "portuguese_water_dog","romagna_water_dog","rottweiler","samoyed","schnauzer",
+  "shetland_sheepdog","siberian_husky","silken_windsprite","spanish_water_dog",
+  "weimaraner","welsh_corgi","whippet","white_swiss_shepherd",
+  "jack_russel_terrier","parson_russel_terrier","border_terrier",
+  "west_highland_white_terrier","yorkshire_terrier","fox_terrier","scottish_terrier","skye_terrier"
+)
+
+# Desired cell probabilities:
+# Independent
+ind.breed_fb.per     <- 0.4
+ind.breed_tb.per     <- 0.56
+ind.breed_knctr.per  <- 0.36
+# Cooperative
+coop.breed_fb.per    <- 0.51
+coop.breed_tb.per    <- 0.37
+coop.breed_knctr.per <- 0.38
+#data from Lonardo et al. (2025)
+
+# random effects settings
+r.effects <- 0.001
+r.slope.condition <- 0.45
+
+# simulations
+n.simus <- 1000
+all.res.all.samples <- data.frame()
+
+# control
+contr <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 100000))
+
+# helper: fixed coefficients (computed once)
+logit <- function(p) log(p/(1-p))
+lp_FB_coop <- logit(coop.breed_fb.per)
+lp_TB_coop <- logit(coop.breed_tb.per)
+lp_KN_coop <- logit(coop.breed_knctr.per)
+lp_FB_ind  <- logit(ind.breed_fb.per)
+lp_TB_ind  <- logit(ind.breed_tb.per)
+lp_KN_ind  <- logit(ind.breed_knctr.per)
+
+coefs <- c(
+  "(Intercept)" = lp_FB_coop,
+  "conditiontrue_belief" = lp_TB_coop - lp_FB_coop,
+  "conditionknowledge_sound_control" = lp_KN_coop - lp_FB_coop,
+  "breed_typeindependent" = lp_FB_ind - lp_FB_coop,
+  "conditiontrue_belief:breed_typeindependent" =
+    lp_TB_ind - (lp_FB_coop + (lp_TB_coop - lp_FB_coop) + (lp_FB_ind - lp_FB_coop)),
+  "conditionknowledge_sound_control:breed_typeindependent" =
+    lp_KN_ind - (lp_FB_coop + (lp_KN_coop - lp_FB_coop) + (lp_FB_ind - lp_FB_coop)),
+  "sexM" = 0,
+  "baited.fstgrey" = 0,
+  "z.age" = -0.49
+)
+
+# Extract p from drop1 robustly
+get_p <- function(tab, term) {
+  if (is.null(tab)) return(NA_real_)
+  rn <- rownames(tab)
+  if (is.null(rn) || !(term %in% rn)) return(NA_real_)
+  cn <- colnames(tab)
+  tgt <- cn[cn %in% c("Pr(>Chi)", "Pr(>Chisq)", "Pr(Chi)", "Pr(>Chisq)")]
+  if (length(tgt) == 0) return(NA_real_)
+  as.numeric(tab[term, tgt[1]])
+}
+
+#User-configurable number of cores
+#user_n_cores <- 3L # set your desired number here
+#Safe cap against available cores
+#max_cores <- parallel::detectCores(logical = TRUE) n_cores <- max(1L, min(user_n_cores, max_cores))
+
+#Create the cluster
+#cl <- parallel::makeCluster(n_cores, type = "PSOCK") message("Using ", n_cores, " cores")
+
+# parallel cluster
+n_cores <- max(1L, detectCores() - 1L)
+cl <- makeCluster(n_cores, type = "PSOCK")
+clusterEvalQ(cl, {
+  library(lme4)
+  library(kyotil)
+})
+
+for (j in seq_along(n.subject)) {
+
+  # Results container for this N
+  all.res <- data.frame(expand.grid(
+    r.effect = r.effects,
+    n.per.subject = n.per.subject,
+    r.slope.condition = r.slope.condition,
+    simu = 1:n.simus
+  ))
+  all.res$n.subject <- n.subject[j]
+  all.res$icpt <- NA
+  all.res$conditiontrue_belief <- NA
+  all.res$conditionknowledge_sound_control <- NA
+  all.res$`conditiontrue_belief:breed_typeindependent` <- NA
+  all.res$`conditionknowledge_sound_control:breed_typeindependent` <- NA
+  all.res$sexM <- NA
+  all.res$baited.fstgrey <- NA
+  all.res$breed_typeindependent <- NA
+  all.res$z.age <- NA
+  all.res$re.sd <- NA
+  all.res$warns.full <- NA
+  all.res$warns.null <- NA
+  all.res$lrt.p.fullnull <- NA
+  all.res$lrt.p.drop1.condition_breed_type <- NA
+  all.res$lrt.p.drop1.sex <- NA
+  all.res$lrt.p.drop1.baited_fst <- NA
+  all.res$lrt.p.drop1.z_age <- NA
+  all.res$mean_choice_fb_cooperative <- NA
+  all.res$mean_choice_fb_independent <- NA
+  all.res$mean_choice_tb_cooperative <- NA
+  all.res$mean_choice_tb_independent <- NA
+  all.res$mean_choice_knctr_cooperative <- NA
+  all.res$mean_choice_knctr_independent <- NA
+
+  # Create subject IDs and full between-subjects design for this N
+  start.data <- data.frame(subj.id = factor(paste("subj", stringr::str_pad(1:n.subject[j], 2, pad = "0"), sep = ".")))
+  design <- expand.grid(
+    condition   = c("false_belief", "true_belief", "knowledge_sound_control"),
+    sex         = c("F", "M"),
+    baited.fst  = c("blue", "grey"),
+    breed_type  = c("cooperative", "independent"),
+    KEEP.OUT.ATTRS = FALSE,
+    stringsAsFactors = FALSE
+  )
+  design_rep <- design[rep(seq_len(nrow(design)), length.out = nrow(start.data)), , drop = FALSE]
+  start.data <- cbind(start.data, design_rep)
+
+  # Fixed per subject: age and z.age (compute once)
+  age <- sample(x = age.range, size = nrow(start.data), replace = TRUE)
+  start.data$age <- as.numeric(age)
+  start.data$z.age <- as.numeric(scale(start.data$age))
+
+  # Factor levels fixed once
+  start.data$condition  <- factor(start.data$condition, levels = c("false_belief","true_belief","knowledge_sound_control"))
+  start.data$breed_type <- factor(start.data$breed_type, levels = c("cooperative","independent"))
+  start.data$sex        <- factor(start.data$sex, levels = c("F","M"))
+  start.data$baited.fst <- factor(start.data$baited.fst, levels = c("blue","grey"))
+
+  # Precompute centered dummies for random slopes (fixed across sims)
+  start.data$condition.dummy1 <- as.numeric(start.data$condition == "true_belief")
+  start.data$condition.dummy2 <- as.numeric(start.data$condition == "knowledge_sound_control")
+  start.data$condition.dummy1.c <- start.data$condition.dummy1 - mean(start.data$condition.dummy1)
+  start.data$condition.dummy2.c <- start.data$condition.dummy2 - mean(start.data$condition.dummy2)
+
+  # Model matrix and fixed LP once per N
+  m.mat <- model.matrix(~ condition*breed_type + sex + baited.fst + z.age, data = start.data)
+  LP_fixed <- as.numeric(m.mat[, names(coefs), drop = FALSE] %*% coefs)
+
+  # Export objects to workers (only small/light objects)
+  clusterExport(cl, varlist = c("start.data","LP_fixed","breed","r.effects","r.slope.condition","contr","get_p"),
+                envir = environment())
+
+  # Reproducible RNG across workers
+  clusterSetRNGStream(cl, iseed = 12345 + j)
+
+  # One simulation function
+  sim_fun <- function(i) {
+    dat <- start.data
+
+    # Sample breed per subject (factor with only sampled levels)
+    dat$breed <- as.factor(sample(x = breed, size = nrow(dat), replace = TRUE))
+
+    # Random effects by unique breed levels
+    nb <- nlevels(dat$breed)
+    b0 <- rnorm(nb, sd = r.effects)
+    b1 <- rnorm(nb, sd = r.slope.condition)
+    b2 <- rnorm(nb, sd = r.slope.condition)
+
+    # Linear predictor
+    idx <- as.numeric(dat$breed)
+    LP <- LP_fixed + b0[idx] +
+      b1[idx] * dat$condition.dummy1.c +
+      b2[idx] * dat$condition.dummy2.c
+
+    # Simulate response
+    dat$choice <- rbinom(n = nrow(dat), size = 1, prob = plogis(LP))
+
+    # Fit models
+    full <- keepWarnings(glmer(
+      choice ~ condition*breed_type + sex + baited.fst + z.age +
+        (1 + condition.dummy1.c + condition.dummy2.c | breed),
+      family = binomial, data = dat, control = contr
+    ))
+    null <- keepWarnings(glmer(
+      choice ~ sex + baited.fst + z.age + (1 | breed),
+      family = binomial, data = dat, control = contr
+    ))
+
+    # drop1
+    d1 <- tryCatch(as.data.frame(drop1(full$value, test = "Chisq")), error = function(e) NULL)
+
+    # Means per condition x breed_type
+    means <- with(dat, tapply(choice, list(condition, breed_type), mean))
+    # Ensure correct extraction order
+    mc_fb_coop <- means["false_belief","cooperative"]
+    mc_fb_ind  <- means["false_belief","independent"]
+    mc_tb_coop <- means["true_belief","cooperative"]
+    mc_tb_ind  <- means["true_belief","independent"]
+    mc_kn_coop <- means["knowledge_sound_control","cooperative"]
+    mc_kn_ind  <- means["knowledge_sound_control","independent"]
+
+    # Fixed effects
+    fe <- tryCatch(fixef(full$value), error = function(e) setNames(rep(NA_real_, 9),
+                     c("(Intercept)","conditiontrue_belief","conditionknowledge_sound_control",
+                       "breed_typeindependent",
+                       "conditiontrue_belief:breed_typeindependent",
+                       "conditionknowledge_sound_control:breed_typeindependent",
+                       "sexM","baited.fstgrey","z.age")))
+
+    re_sd <- tryCatch(as.data.frame(summary(full$value)$varcor)[1, "sdcor"], error = function(e) NA_real_)
+    lrt_fullnull <- tryCatch(as.data.frame(anova(null$value, full$value, test = "Chisq"))[2, "Pr(>Chisq)"],
+                             error = function(e) NA_real_)
+
+    # Assemble one row
+    out <- list(
+      icpt = fe["(Intercept)"],
+      conditiontrue_belief = fe["conditiontrue_belief"],
+      conditionknowledge_sound_control = fe["conditionknowledge_sound_control"],
+      `conditiontrue_belief:breed_typeindependent` = fe["conditiontrue_belief:breed_typeindependent"],
+      `conditionknowledge_sound_control:breed_typeindependent` = fe["conditionknowledge_sound_control:breed_typeindependent"],
+      sexM = fe["sexM"],
+      baited.fstgrey = fe["baited.fstgrey"],
+      breed_typeindependent = fe["breed_typeindependent"],
+      z.age = fe["z.age"],
+      warns.full = nchar(paste(full$warnings, collapse = "")),
+      warns.null = nchar(paste(null$warnings, collapse = "")),
+      re.sd = re_sd,
+      lrt.p.fullnull = lrt_fullnull,
+      lrt.p.drop1.condition_breed_type = get_p(d1, "condition:breed_type"),
+      lrt.p.drop1.sex = get_p(d1, "sex"),
+      lrt.p.drop1.baited_fst = get_p(d1, "baited.fst"),
+      lrt.p.drop1.z_age = get_p(d1, "z.age"),
+      mean_choice_fb_cooperative = as.numeric(mc_fb_coop),
+      mean_choice_fb_independent = as.numeric(mc_fb_ind),
+      mean_choice_tb_cooperative = as.numeric(mc_tb_coop),
+      mean_choice_tb_independent = as.numeric(mc_tb_ind),
+      mean_choice_knctr_cooperative = as.numeric(mc_kn_coop),
+      mean_choice_knctr_independent = as.numeric(mc_kn_ind)
+    )
+    out
+  }
+
+  # Run simulations in parallel
+  res_list <- parLapply(cl, 1:n.simus, sim_fun)
+
+  # Bind into all.res in original order
+  res_df <- as.data.frame(do.call(rbind, res_list))
+
+  # Coerce to numeric where needed (parLapply can return lists)
+  num_cols <- c("icpt","conditiontrue_belief","conditionknowledge_sound_control",
+                "conditiontrue_belief:breed_typeindependent","conditionknowledge_sound_control:breed_typeindependent",
+                "sexM","baited.fstgrey","breed_typeindependent","z.age",
+                "warns.full","warns.null","re.sd","lrt.p.fullnull",
+                "lrt.p.drop1.condition_breed_type","lrt.p.drop1.sex","lrt.p.drop1.baited_fst","lrt.p.drop1.z_age",
+                "mean_choice_fb_cooperative","mean_choice_fb_independent",
+                "mean_choice_tb_cooperative","mean_choice_tb_independent",
+                "mean_choice_knctr_cooperative","mean_choice_knctr_independent")
+  res_df[num_cols] <- lapply(res_df[num_cols], function(x) as.numeric(as.character(x)))
+  
+  # Fill the all.res skeleton
+  all.res[, names(res_df)] <- res_df
+
+  all.res.all.samples <- rbind(all.res.all.samples, all.res)
+  message("Finished N = ", n.subject[j])
+  
+}
+
+stopCluster(cl)
+
+
+library(here)
+# Save image relative to the project root
+save.image(file = here("power_analysis", "power_sim_Auditory_FB2_workspace_parallel.RData"))
+```
+
+Notes on changes
+- Efficiency:
+  - z.age is computed once per sample size, not recomputed each simulation.
+  - Factor levels and centered dummies are computed once per sample size.
+  - The model matrix and the fixed-effects linear predictor (LP_fixed) are computed once per sample size.
+  - In each simulation we only sample breed, draw random effects, simulate choice, and fit the same two models.
+  - Cell means are computed via tapply instead of a grouped dplyr pipeline.
+
+- Parallelisation:
+  - Uses base parallel::parLapply over simulations within each sample size (outer loop over n.subject retained).
+  - Workers load lme4 and kyotil, and receive required objects via clusterExport.
+  - RNG is reproducible via clusterSetRNGStream(cl, iseed = 12345 + j).
+
+
+##Evaluation
+```{r}
+#Number of warnings per parameter cell
+
+# tidy data frame (often more convenient than a 3D array)
+warn_table_df <- all.res.all.samples %>%
+  mutate(warn = as.integer(warns.full > 0)) %>%
+  group_by(n.subject, r.effect, r.slope.condition) %>%
+  summarise(n.warns = sum(warn), .groups = "drop")
+
+# if you still prefer an array like tapply, you can do:
+warn_table <- with(
+  all.res.all.samples,
+  tapply(
+    X = (warns.full > 0),
+    INDEX = list(n.subject = n.subject,
+                 r.effect = r.effect,
+                 r.slope.condition = r.slope.condition),
+    FUN = sum
+  )
+)
+
+```
+Converged-only subset
+
+
+```{r}
+all.res2 <- all.res.all.samples %>% filter(warns.full == 0) #57 out of 20000 models failed to converge (0.003%)
+
+#How many models converged and power summaries
+
+# One pass: compute convergence, full-null, interaction, and condition means
+# Denominator for "power" remains n.simus to be consistent with your workflow
+lrt.data2 <- all.res2 %>%
+  group_by(n.subject, r.effect, r.slope.condition) %>%
+  summarise(
+    # convergence count per cell
+    n.converged = n(),
+    # full-null LRT
+    lrt.p.fullnull.median = median(lrt.p.fullnull, na.rm = TRUE),
+    n.sign.lrt.fullnull   = sum(lrt.p.fullnull < 0.025, na.rm = TRUE),
+    proportion.sign.lrt.fullnull = n.sign.lrt.fullnull / n.simus,
+    # interaction term (condition:breed_type) from drop1
+    lrt.p.int.median = median(lrt.p.drop1.condition_breed_type, na.rm = TRUE),
+    n.sign.lrt.int   = sum(lrt.p.drop1.condition_breed_type < 0.025, na.rm = TRUE),
+    proportion.sign.lrt.int = n.sign.lrt.int / n.simus,
+    # condition means by breed type (no averaging)
+    mean_choice_fb_cooperative    = mean(mean_choice_fb_cooperative, na.rm = TRUE),
+    mean_choice_fb_independent    = mean(mean_choice_fb_independent, na.rm = TRUE),
+    mean_choice_tb_cooperative    = mean(mean_choice_tb_cooperative, na.rm = TRUE),
+    mean_choice_tb_independent    = mean(mean_choice_tb_independent, na.rm = TRUE),
+    mean_choice_knctr_cooperative = mean(mean_choice_knctr_cooperative, na.rm = TRUE),
+    mean_choice_knctr_independent = mean(mean_choice_knctr_independent, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+lrt.data2
+save.image("power_sim_Auditory_FB2_eval.RData")
+
+
+```
+
+
+Notes on efficiency
+- The warnings are summarized once using mutate + summarise, avoiding repeated indexing and avoiding a separate n.converged join later.
+- All summary metrics are computed in a single summarise call over the grouped data, eliminating the need for a separate n.converged table and full_join.
+- Using na.rm = TRUE in summaries ensures robustness if any p-values are missing.
+- If you prefer your “power” to reflect only converged models, replace the denominator by n.converged instead of n.simus:
+  proportion.sign.lrt.fullnull = n.sign.lrt.fullnull / n.converged
+  proportion.sign.lrt.int = n.sign.lrt.int / n.converged
+  Plotting: power vs total sample size
+```{r}
+library(ggplot2)
+
+plot.sample.sizes.power.auditory_FB <- ggplot(lrt.data2,
+                                              aes(x = n.subject, y = proportion.sign.lrt.fullnull * 100)) +
+  geom_col() +
+  ylab("Power (% significant LRT for full–null comparison)") +
+  xlab("Total sample size") + scale_x_continuous(breaks = sort(unique(lrt.data2$n.subject))) + geom_hline(
+    yintercept = 80,
+    col = "blue",
+    lty = 2,
+    lwd = 0.9
+  ) + theme_classic()
+
+ggsave(plot.sample.sizes.power.auditory_FB, filename = "./plots/sample_sizes_power_analysis_auditory_FB.png", scale = 0.55, height = 6, width = 15)
+```
+
+
+Condition means (averaged across breed types), by sample size
+
+```{r}
+library(tidyr)
+
+cond_means_bt <- lrt.data2 %>% select(
+  n.subject,
+  mean_choice_fb_cooperative,
+  mean_choice_tb_cooperative,
+  mean_choice_knctr_cooperative,
+  mean_choice_fb_independent,
+  mean_choice_tb_independent,
+  mean_choice_knctr_independent
+) %>% pivot_longer(-n.subject, names_to = "name", values_to = "mean_choice") %>% mutate(
+  breed_type = ifelse(grepl("cooperative$", name), "cooperative", "independent"),
+  condition = case_when(
+    grepl("fb", name) ~ "fb",
+    grepl("tb", name) ~ "tb",
+    grepl("knctr", name) ~ "control",
+    TRUE ~ NA_character_
+  )
+)
+
+
+ggplot(cond_means_bt,
+       aes(x = condition, y = mean_choice, fill = breed_type)) +
+  geom_col(position = position_dodge(width = 0.8), color = "black") +
+  facet_wrap(~ n.subject) + theme_classic() + labs(y = "Mean choice", x = "Condition", fill = "Breed type")
+
+ggsave(last_plot(),
+       filename = "plots/mean_choices.png",
+       scale = 0.55, height = 12, width = 16)
+```
+
+
+
+Proportion of significant LRTs for condition (converged models only)
+
+```{r}
+# If  r.effect and/or r.slope.condition vary, facet by them; if not, this reduces to bars by N
+p.int.power <- ggplot(lrt.data2, aes(x = factor(n.subject), y = proportion.sign.lrt.int)) +
+  geom_col(color = "black", fill = "dodgerblue") +
+  scale_y_continuous(breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
+  geom_hline(yintercept = 0.8, colour = "black", lwd = 1, lty = 2) +
+  labs(y = "Power (proportion significant LRT for condition:breed type)",
+       x = "Total sample size (N)") +
+  theme_bw() +
+  facet_grid(r.slope.condition ~ r.effect, labeller = label_both)
+
+p.int.power
+
+ggsave(p.int.power,
+       filename = "plots/differentNs_power.png",
+       scale = 0.55, height = 12, width = 16)
+```
+
+
+
