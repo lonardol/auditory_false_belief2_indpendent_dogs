@@ -7,13 +7,13 @@ date: "2025-08-10"
 
 ```{r}
 rm(list=ls())
-library(tidyverse)
 library(cowplot)
 library(gghalves)
 library(ggthemes)
 library(lme4)
 library(kyotil)   # keepWarnings
 library(parallel) # base R parallel
+library(tidyverse)
 ```
 
 
@@ -43,6 +43,23 @@ breed <- c(
   "west_highland_white_terrier","yorkshire_terrier","fox_terrier","scottish_terrier","skye_terrier"
 )
 
+coop.breeds<-c("appenzell_cattle_dog", "australian_cattle_dog", "australian_shepherd","austrian_pinscher","belgian_shepherd",
+  "bernese_mountain_dog","bobtail","bohemian_shepherd_dog","border_collie",
+  "bouvier_des_flandres","brittany_spaniel","bullmastiff","cocker_spaniel","collie","dalmatian","danish_swedish_farmdog","dutch_shepherd",
+  "english_springer_spaniel","entlebucher_mountain_dog","flat_coated_retriever",
+  "french_water_dog","german_longhaired_pointer","german_pinscher","german_shepherd",
+  "german_short_haired_pointer","german_spitz", "german_wirehaired_pointer",
+  "golden_retriever","great_swiss_mountain_dog","hovawart",
+  "hungarian_shorthaired_pointer","irish_setter","italian_spinone",
+  "kleiner_muensterlaender","labrador_retriever","miniature_american_shepherd",
+  "miniature_pinscher","mudi","nova_scotia_duck_tolling_retriever","picardy_spaniel",
+  "portuguese_water_dog","romagna_water_dog","rottweiler","schnauzer",
+  "shetland_sheepdog","spanish_water_dog",
+  "weimaraner","welsh_corgi","white_swiss_shepherd")
+
+indep.breeds<-c("akita_inu", "andalusian_hound", "basenji","beagle","canarian_warrenhound","greyhound","icelandic_sheepdog","samoyed", "siberian_husky","silken_windsprite","whippet", "jack_russel_terrier","parson_russel_terrier","border_terrier",
+  "west_highland_white_terrier","yorkshire_terrier","fox_terrier","scottish_terrier","skye_terrier")
+
 # Desired cell probabilities:
 # Independent
 ind.breed_fb.per     <- 0.4
@@ -59,7 +76,7 @@ r.effects <- 0.001
 r.slope.condition <- 0.45
 
 # simulations
-n.simus <- 1000
+n.simus <- 1000 
 all.res.all.samples <- data.frame()
 
 # control
@@ -184,7 +201,7 @@ for (j in seq_along(n.subject)) {
   LP_fixed <- as.numeric(m.mat[, names(coefs), drop = FALSE] %*% coefs)
 
   # Export objects to workers (only small/light objects)
-  clusterExport(cl, varlist = c("start.data","LP_fixed","breed","r.effects","r.slope.condition","contr","get_p"),
+  clusterExport(cl, varlist = c("start.data","LP_fixed","breed","r.effects","r.slope.condition","contr","get_p", "coop.breeds","indep.breeds"),
                 envir = environment())
 
   # Reproducible RNG across workers
@@ -194,8 +211,18 @@ for (j in seq_along(n.subject)) {
   sim_fun <- function(i) {
     dat <- start.data
 
-    # Sample breed per subject (factor with only sampled levels)
-    dat$breed <- as.factor(sample(x = breed, size = nrow(dat), replace = TRUE))
+    # Sample breed per subject (factor with only sampled levels, based on breed_type)
+    #LL: old 
+    #dat$breed <- as.factor(sample(x = breed, size = nrow(dat), replace = TRUE))
+   dat$breed <- apply(dat, 1, function(row) {
+  if (row["breed_type"] == "cooperative") {
+    sample(coop.breeds, 1)
+  } else {
+    sample(indep.breeds, 1)
+  }
+})
+
+dat$breed <- factor(dat$breed) 
 
     # Random effects by unique breed levels
     nb <- nlevels(dat$breed)
@@ -222,9 +249,18 @@ for (j in seq_along(n.subject)) {
       choice ~ sex + baited.fst + z.age + (1 | breed),
       family = binomial, data = dat, control = contr
     ))
+    
+    red<-keepWarnings(glmer(
+      choice ~ condition + breed_type + sex + baited.fst + z.age +
+        (1 + condition.dummy1.c + condition.dummy2.c | breed),
+      family = binomial, data = dat, control = contr
+    ))
 
-    # drop1
+    # drop1: effect of interaction 
     d1 <- tryCatch(as.data.frame(drop1(full$value, test = "Chisq")), error = function(e) NULL)
+    
+    # drop1: main effect of condition & breed type
+    d2 <- tryCatch(as.data.frame(drop1(red$value, test = "Chisq")), error = function(e) NULL)
 
     # Means per condition x breed_type
     means <- with(dat, tapply(choice, list(condition, breed_type), mean))
@@ -247,6 +283,9 @@ for (j in seq_along(n.subject)) {
     re_sd <- tryCatch(as.data.frame(summary(full$value)$varcor)[1, "sdcor"], error = function(e) NA_real_)
     lrt_fullnull <- tryCatch(as.data.frame(anova(null$value, full$value, test = "Chisq"))[2, "Pr(>Chisq)"],
                              error = function(e) NA_real_)
+    
+        lrt_fullred <- tryCatch(as.data.frame(anova(red$value, full$value, test = "Chisq"))[2, "Pr(>Chisq)"],
+                             error = function(e) NA_real_)
 
     # Assemble one row
     out <- list(
@@ -263,7 +302,10 @@ for (j in seq_along(n.subject)) {
       warns.null = nchar(paste(null$warnings, collapse = "")),
       re.sd = re_sd,
       lrt.p.fullnull = lrt_fullnull,
+      lrt.p.fullred = lrt_fullred,
       lrt.p.drop1.condition_breed_type = get_p(d1, "condition:breed_type"),
+      lrt.p.drop1.condition = get_p(d2, "condition"),
+      lrt.p.drop1.breed_type = get_p(d2, "breed_type"),
       lrt.p.drop1.sex = get_p(d1, "sex"),
       lrt.p.drop1.baited_fst = get_p(d1, "baited.fst"),
       lrt.p.drop1.z_age = get_p(d1, "z.age"),
@@ -287,8 +329,8 @@ for (j in seq_along(n.subject)) {
   num_cols <- c("icpt","conditiontrue_belief","conditionknowledge_sound_control",
                 "conditiontrue_belief:breed_typeindependent","conditionknowledge_sound_control:breed_typeindependent",
                 "sexM","baited.fstgrey","breed_typeindependent","z.age",
-                "warns.full","warns.null","re.sd","lrt.p.fullnull",
-                "lrt.p.drop1.condition_breed_type","lrt.p.drop1.sex","lrt.p.drop1.baited_fst","lrt.p.drop1.z_age",
+                "warns.full","warns.null","re.sd","lrt.p.fullnull", "lrt.p.fullred",
+                "lrt.p.drop1.condition_breed_type","lrt.p.drop1.condition", "lrt.p.drop1.breed_type", "lrt.p.drop1.sex","lrt.p.drop1.baited_fst","lrt.p.drop1.z_age",
                 "mean_choice_fb_cooperative","mean_choice_fb_independent",
                 "mean_choice_tb_cooperative","mean_choice_tb_independent",
                 "mean_choice_knctr_cooperative","mean_choice_knctr_independent")
@@ -357,28 +399,83 @@ all.res2 <- all.res.all.samples %>% filter(warns.full == 0) #57 out of 20000 mod
 
 # One pass: compute convergence, full-null, interaction, and condition means
 # Denominator for "power" remains n.simus to be consistent with your workflow
+
 lrt.data2 <- all.res2 %>%
-  group_by(n.subject, r.effect, r.slope.condition) %>%
-  summarise(
+  dplyr::ungroup() %>% 
+  dplyr::group_by(n.subject) %>% 
+  dplyr::summarise(
     # convergence count per cell
-    n.converged = n(),
+    n.converged = dplyr::n(),
+
+    # total number of simulations in this group
+    n.simus = dplyr::n(),   # <-- auto-calculated; remove if you already have it elsewhere
+
     # full-null LRT
     lrt.p.fullnull.median = median(lrt.p.fullnull, na.rm = TRUE),
     n.sign.lrt.fullnull   = sum(lrt.p.fullnull < 0.025, na.rm = TRUE),
+    n.sign.lrt.fullred    = sum(lrt.p.fullred < 0.025, na.rm = TRUE),
     proportion.sign.lrt.fullnull = n.sign.lrt.fullnull / n.simus,
+    proportion.sign.lrt.fullred  = n.sign.lrt.fullred / n.simus,
+
     # interaction term (condition:breed_type) from drop1
     lrt.p.int.median = median(lrt.p.drop1.condition_breed_type, na.rm = TRUE),
     n.sign.lrt.int   = sum(lrt.p.drop1.condition_breed_type < 0.025, na.rm = TRUE),
     proportion.sign.lrt.int = n.sign.lrt.int / n.simus,
-    # condition means by breed type (no averaging)
+
+    # main effect of condition from drop1
+    lrt.p.condition.median = median(lrt.p.drop1.condition, na.rm = TRUE),
+    n.sign.lrt.condition   = sum(lrt.p.drop1.condition < 0.025, na.rm = TRUE),
+    proportion.sign.lrt.condition = n.sign.lrt.condition / n.simus,
+
+    # main effect of breed type from drop1
+    lrt.p.breed.type.median = median(lrt.p.drop1.breed_type, na.rm = TRUE),
+    n.sign.lrt.breed.type   = sum(lrt.p.drop1.breed_type < 0.025, na.rm = TRUE),
+    proportion.sign.lrt.breed.type = n.sign.lrt.breed.type / n.simus,  # <-- fixed
+
+    # condition means by breed type (no averaging across groups)
     mean_choice_fb_cooperative    = mean(mean_choice_fb_cooperative, na.rm = TRUE),
     mean_choice_fb_independent    = mean(mean_choice_fb_independent, na.rm = TRUE),
     mean_choice_tb_cooperative    = mean(mean_choice_tb_cooperative, na.rm = TRUE),
     mean_choice_tb_independent    = mean(mean_choice_tb_independent, na.rm = TRUE),
     mean_choice_knctr_cooperative = mean(mean_choice_knctr_cooperative, na.rm = TRUE),
     mean_choice_knctr_independent = mean(mean_choice_knctr_independent, na.rm = TRUE),
+
     .groups = "drop"
   )
+
+#LL: OLD
+# lrt.data2 <- all.res2 %>%
+#   group_by(n.subject) %>% #, r.effect, r.slope.condition) %>%
+#   summarise(
+#     # convergence count per cell
+#     n.converged = n(),
+#     # full-null LRT
+#     lrt.p.fullnull.median = median(lrt.p.fullnull, na.rm = TRUE),
+#     n.sign.lrt.fullnull   = sum(lrt.p.fullnull < 0.025, na.rm = TRUE),
+#     n.sign.lrt.fullred   = sum(lrt.p.fullred < 0.025, na.rm = TRUE),
+#     proportion.sign.lrt.fullnull = n.sign.lrt.fullnull / n.simus,
+#     proportion.sign.lrt.fullred = n.sign.lrt.fullred / n.simus,
+#     # interaction term (condition:breed_type) from drop1
+#     lrt.p.int.median = median(lrt.p.drop1.condition_breed_type, na.rm = TRUE),
+#     n.sign.lrt.int   = sum(lrt.p.drop1.condition_breed_type < 0.025, na.rm = TRUE),
+#     proportion.sign.lrt.int = n.sign.lrt.int / n.simus,
+#     # main effect of condition from drop1
+#     lrt.p.condition.median = median(lrt.p.drop1.condition, na.rm = TRUE),
+#     n.sign.lrt.condition   = sum(lrt.p.drop1.condition < 0.025, na.rm = TRUE),
+#     proportion.sign.lrt.condition = n.sign.lrt.condition / n.simus,
+#     # main effect of breed type from drop1
+#     lrt.p.breed.type.median = median(lrt.p.drop1.breed_type, na.rm = TRUE),
+#     n.sign.lrt.breed.type   = sum(lrt.p.drop1.breed_type < 0.025, na.rm = TRUE),
+#     proportion.sign.lrt.breed.type = lrt.p.drop1.breed_type / n.simus,
+#     # condition means by breed type (no averaging)
+#     mean_choice_fb_cooperative    = mean(mean_choice_fb_cooperative, na.rm = TRUE),
+#     mean_choice_fb_independent    = mean(mean_choice_fb_independent, na.rm = TRUE),
+#     mean_choice_tb_cooperative    = mean(mean_choice_tb_cooperative, na.rm = TRUE),
+#     mean_choice_tb_independent    = mean(mean_choice_tb_independent, na.rm = TRUE),
+#     mean_choice_knctr_cooperative = mean(mean_choice_knctr_cooperative, na.rm = TRUE),
+#     mean_choice_knctr_independent = mean(mean_choice_knctr_independent, na.rm = TRUE),
+#     .groups = "drop"
+#   )
 
 lrt.data2
 save.image("power_sim_Auditory_FB2_eval.RData")
